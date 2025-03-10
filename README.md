@@ -1,5 +1,5 @@
 # Linux-Server-Backup
-从Linux服务器传输文件到Windows，使用格式化日期名称的文件夹进行分类。
+从Linux服务器传输文件到Windows，自动生成格式化日期名称的文件夹用于分类。
 
 ### servers.cfg
 ```
