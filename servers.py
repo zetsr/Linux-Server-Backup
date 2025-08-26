@@ -67,9 +67,9 @@ def load_projects_from_config(config_file='servers.cfg'):
         except KeyError as e:
             logger.error(f"配置文件 {section} 缺少必要字段或格式错误: {str(e)}，跳过此项")
 
-# 定义递归传输函数，带重试机制
-def sftp_get_recursive(sftp, remote_dir, local_dir, failed_files):
-    """递归传输远程目录及其内容到本地，记录失败文件"""
+# 定义递归传输函数，带重试机制和统计
+def sftp_get_recursive(sftp, remote_dir, local_dir, failed_files, stats):
+    """递归传输远程目录及其内容到本地，记录失败文件并统计"""
     try:
         for entry in sftp.listdir_attr(remote_dir):
             remote_path = remote_dir + '/' + entry.filename
@@ -77,27 +77,35 @@ def sftp_get_recursive(sftp, remote_dir, local_dir, failed_files):
             if stat.S_ISDIR(entry.st_mode):
                 if not os.path.exists(local_path):
                     os.makedirs(local_path)
-                sftp_get_recursive(sftp, remote_path, local_path, failed_files)
+                sftp_get_recursive(sftp, remote_path, local_path, failed_files, stats)
             else:
-                max_retries = 3
+                stats['total_files'] += 1  # 统计总文件数
+                max_retries = 5
+                retry_wait = 1  # 初始等待时间（秒）
+                success = False
                 for attempt in range(max_retries):
                     try:
                         sftp.get(remote_path, local_path)
                         logger.info(f"成功传输文件: {remote_path} -> {local_path}")
+                        stats['successful_files'] += 1
+                        success = True
                         break
                     except Exception as e:
                         if attempt < max_retries - 1:
-                            logger.warning(f"传输 {remote_path} 失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}，正在重试")
-                            time.sleep(1)
+                            logger.warning(f"传输 {remote_path} 失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}，等待 {retry_wait} 秒后重试")
+                            time.sleep(retry_wait)
+                            retry_wait *= 2  # 指数退避
                         else:
                             logger.error(f"传输 {remote_path} 最终失败: {str(e)}，跳过此文件")
                             failed_files.append(remote_path)
+                if not success:
+                    stats['failed_files'] += 1
     except Exception as e:
         logger.error(f"遍历目录 {remote_dir} 时出错: {str(e)}，继续传输其他文件")
 
 # 处理单个项目的传输
 def transfer_project(project):
-    """处理单个项目的文件传输并返回结果"""
+    """处理单个项目的文件传输并返回统计结果"""
     ip = project['ip']
     user = project['user']
     password = project['password']
@@ -112,6 +120,9 @@ def transfer_project(project):
     local_dir = os.path.join(pc_base_dir, current_date)
     local_saved_dir = os.path.join(local_dir, last_dir)
 
+    # 初始化统计
+    stats = {'total_files': 0, 'successful_files': 0, 'failed_files': 0}
+
     # 确保 pc_base_dir 存在
     try:
         if not os.path.exists(pc_base_dir):
@@ -119,7 +130,7 @@ def transfer_project(project):
             logger.info(f"创建基础目录: {pc_base_dir}")
     except Exception as e:
         logger.error(f"创建基础目录 {pc_base_dir} 失败: {str(e)}，跳过此项目")
-        return "完全失败", 0
+        return stats  # 返回默认统计（全部0）
 
     # 创建本地目录（包含日期和最后一个目录名）
     try:
@@ -128,7 +139,7 @@ def transfer_project(project):
         logger.info(f"创建本地目录: {local_saved_dir}")
     except Exception as e:
         logger.error(f"创建目录 {local_saved_dir} 失败: {str(e)}，跳过此项目")
-        return "完全失败", 0
+        return stats
 
     # 建立 SSH 连接，指定端口
     ssh = paramiko.SSHClient()
@@ -138,30 +149,31 @@ def transfer_project(project):
         logger.info(f"成功连接到服务器: {ip}:{port} (项目: {server_dir})")
     except Exception as e:
         logger.error(f"连接服务器 {ip}:{port} 失败: {str(e)}，跳过此项目")
-        return "完全失败", 0
+        stats['failed_files'] = 1  # 标记为完全失败
+        return stats
 
     # 打开 SFTP 会话并传输文件
     failed_files = []
     try:
         sftp = ssh.open_sftp()
-        sftp_get_recursive(sftp, server_dir, local_saved_dir, failed_files)
+        sftp_get_recursive(sftp, server_dir, local_saved_dir, failed_files, stats)
         sftp.close()
     except Exception as e:
         logger.error(f"SFTP 操作 {server_dir} 出错: {str(e)}，跳过此项目")
         failed_files.append("SFTP 会话中断，未完成传输")
+        stats['failed_files'] = 1  # 标记为完全失败
     finally:
         ssh.close()
 
-    # 判断传输结果
-    if not failed_files:
-        logger.info(f"项目 {server_dir} 传输结果: 全部成功")
-        return "全部成功", 0
-    elif failed_files and failed_files[0] == "SFTP 会话中断，未完成传输":
-        logger.info(f"项目 {server_dir} 传输结果: 完全失败")
-        return "完全失败", len(failed_files)
-    else:
-        logger.info(f"项目 {server_dir} 传输结果: 部分失败，失败文件数量: {len(failed_files)}")
-        return "部分失败", len(failed_files)
+    # 如果有失败文件但不是会话中断，调整统计
+    if failed_files and "SFTP 会话中断，未完成传输" in failed_files:
+        stats['total_files'] = 0  # 会话中断，无法统计总文件
+        stats['successful_files'] = 0
+        stats['failed_files'] = 1
+    elif failed_files:
+        stats['failed_files'] = len(failed_files)
+
+    return stats
 
 # 主函数，处理所有项目
 def main():
@@ -172,17 +184,25 @@ def main():
         input("按 Enter 键退出程序...")
         exit(1)
 
-    for project in projects:
+    # 收集所有项目的统计
+    all_stats = []
+    for idx, project in enumerate(projects, start=1):
         ip = project['ip']
         server_dir = project['server_dir']
-        logger.info(f"开始处理项目: {ip} - {server_dir}")
-        result, failed_count = transfer_project(project)
-        if result == "部分失败":
-            logger.info(f"项目 {ip} - {server_dir} 部分失败详情: 失败 {failed_count} 个文件")
-        elif result == "完全失败":
-            logger.info(f"项目 {ip} - {server_dir} 完全失败")
+        logger.info(f"开始处理任务[{idx}]: {ip} - {server_dir}")
+        stats = transfer_project(project)
+        all_stats.append(stats)
+        # 实时日志统计
+        logger.info(f"任务[{idx}] 实时统计: 共 {stats['total_files']} 个文件（{stats['successful_files']}个成功）（{stats['failed_files']}个失败）")
+
+    # 所有任务完成后，统一输出统计结果
+    logger.info("所有任务完成。以下是统计结果：")
+    output = ""
+    for idx, stats in enumerate(all_stats, start=1):
+        output += f"任务[{idx}] - 共 {stats['total_files']} 个文件（{stats['successful_files']}个成功）（{stats['failed_files']}个失败）"
+    logger.info(output)
 
 # 主程序入口
 if __name__ == "__main__":
     main()
-    input()
+    input("按 Enter 键退出程序...")
