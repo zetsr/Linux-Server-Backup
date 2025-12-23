@@ -13,9 +13,9 @@ pc_dir = "D:\backup\myserver"
 
 [s2]
 ip = "192.168.2.1"
-port = "1222"
-user = "backup"
+port = "22"
+user = "administrator"
 password = "pw"
-server_dir = "/root/csgo_ds/csgo/addons/sourcemod/data/sqlite"
+server_dir = "C:\game\saved"
 pc_dir = "D:\backup\csgo_ds"
 ```
